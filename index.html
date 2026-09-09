@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Ludo Online</title>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="vendor/trystero.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
@@ -869,23 +869,52 @@ function snapshot(){
   };
 }
 
+/* ---------- Networking: Trystero (WebRTC over public relays, no backend) ---------- */
+const NET_APP_ID = 'ludo-online-v1';
+
+function teardownNet(){
+  if (net && net.room){ try{ net.room.leave(); }catch(e){} }
+  net = null;
+}
+
 function send(msg){
-  if (net && net.conns) net.conns.forEach(c=>{ if (c.open) c.send(msg); });
+  if (!net || !net.sendMsg) return;
+  if (msg.t === 'lobby') net.lastLobby = msg;
+  net.sendMsg(msg);
 }
 function broadcast(msg){ send(msg); }
 
-function initNetwork(){
-  net = { peer:null, conns:[], isHost:false, code:null };
+function setupRoom(code, isHost){
+  teardownNet();
+  net = {
+    room:null, sendMsg:null, onMsg:null,
+    isHost:!!isHost, code,
+    conns:[],            // connected peer ids (host side)
+    seatByPeer:{},       // peerId -> seat color (host side)
+    hostPeerId:null,     // guest side
+    joined:false,
+    lastLobby:null
+  };
+  const room = TrysteroLib.joinRoom({appId:NET_APP_ID}, 'ludo-room-' + code);
+  net.room = room;
+  const action = room.makeAction('msg');
+  action.onMessage = (payload, ctx) => { if (net && net.onMsg) net.onMsg(payload, ctx && ctx.peerId); };
+  net.sendMsg = (msg, opts) => {
+    const o = opts && opts.target ? {target: opts.target} : undefined;
+    Promise.resolve(action.send(msg, o)).catch(()=>{});
+  };
+  return room;
+}
+
+function sendTo(peerId, msg){
+  if (net && net.sendMsg) net.sendMsg(msg, {target:peerId});
 }
 
 /* ----- HOST ----- */
 function hostRoom(){
-  initNetwork();
-  net.isHost = true;
+  const code = makeCode();
   app.mode = 'online';
   app.mySeat = 'red';
-  const code = makeCode();
-  net.code = code;
   app.roomCode = code;
   app.seats = []; app.names = {}; app.humans = {};
   els.roomCode.textContent = code;
@@ -894,30 +923,19 @@ function hostRoom(){
   els.lobbyList.innerHTML = '';
   els.btnStart.disabled = true;
   try {
-    const peer = new Peer('ludo-' + code, {debug:0});
-    net.peer = peer;
-    peer.on('open', ()=>{
-      els.createStatus.textContent = 'Room open! Share the code.';
-      els.createStatus.classList.add('ok');
-      addSeat('red', 'Host', true);
-    });
-    peer.on('connection', conn=>{
-      conn.on('open', ()=>{
-        if (!G && net.conns.length >= 3){ conn.send({t:'full'}); setTimeout(()=>conn.close(), 300); return; }
-        net.conns.push(conn);
-        conn.on('data', d => hostOnData(conn, d));
-        conn.on('close', ()=>onGuestLeft(conn));
-      });
-    });
-    peer.on('error', e=>{
-      if (e.type === 'unavailable-id'){
-        els.createStatus.textContent = 'That code is taken — retrying…';
-        setTimeout(hostRoom, 400);
-      } else {
-        els.createStatus.textContent = 'Network error: ' + e.type;
-        els.createStatus.classList.add('err');
-      }
-    });
+    setupRoom(code, true);
+    net.onMsg = (payload, peerId) => hostOnData(peerId, payload);
+    net.room.onPeerJoin = peerId => {
+      net.conns.push(peerId);
+      if (net.lastLobby) sendTo(peerId, net.lastLobby);   // catch the newcomer up
+    };
+    net.room.onPeerLeave = peerId => {
+      net.conns = net.conns.filter(id => id !== peerId);
+      onGuestLeft(peerId);
+    };
+    addSeat('red', 'Host', true);
+    els.createStatus.textContent = 'Room open! Share the code.';
+    els.createStatus.classList.add('ok');
   } catch(e){
     els.createStatus.textContent = 'Could not start networking. Are you online?';
     els.createStatus.classList.add('err');
@@ -934,9 +952,9 @@ function addSeat(color, name, human){
   broadcast({t:'lobby', seats:app.seats, names:app.names});
 }
 
-function onGuestLeft(conn){
-  net.conns = net.conns.filter(c=>c!==conn);
-  const c = conn._seat;
+function onGuestLeft(peerId){
+  const c = net.seatByPeer[peerId];
+  delete net.seatByPeer[peerId];
   if (!c) return;
   if (!G){
     delete app.names[c]; delete app.humans[c];
@@ -952,25 +970,25 @@ function onGuestLeft(conn){
   }
 }
 
-function hostOnData(conn, d){
+function hostOnData(peerId, d){
   if (!d || typeof d !== 'object') return;
   if (d.t === 'hi'){
-    if (conn._seat) return;
-    if (G){ conn.send({t:'busy'}); return; }
+    if (net.seatByPeer[peerId]) return;
+    if (G){ sendTo(peerId, {t:'busy'}); return; }
     const color = ['yellow','green','blue'].find(c=>!app.seats.includes(c));
-    if (!color){ conn.send({t:'full'}); return; }
-    conn._seat = color;
-    conn.send({t:'welcome', seat:color});
+    if (!color){ sendTo(peerId, {t:'full'}); return; }
+    net.seatByPeer[peerId] = color;
+    sendTo(peerId, {t:'welcome', seat:color});
     addSeat(color, ((d.name||'Player')+'').slice(0,14), true);
   }
-  else if (d.t === 'roll' && conn._seat && G && G.phase==='roll' && curColor()===conn._seat){
-    performRoll(conn._seat);
+  else if (d.t === 'roll' && net.seatByPeer[peerId] && G && G.phase==='roll' && curColor()===net.seatByPeer[peerId]){
+    performRoll(net.seatByPeer[peerId]);
   }
-  else if (d.t === 'move' && conn._seat && G && G.phase==='move' && curColor()===conn._seat){
-    if (legalMoves(conn._seat, G.lastRoll).some(m=>m.token===d.token)) doMove(d.token);
+  else if (d.t === 'move' && net.seatByPeer[peerId] && G && G.phase==='move' && curColor()===net.seatByPeer[peerId]){
+    if (legalMoves(net.seatByPeer[peerId], G.lastRoll).some(m=>m.token===d.token)) doMove(d.token);
   }
-  else if (d.t === 'chat' && conn._seat){
-    chatPush(cname(conn._seat), String(d.msg||'').slice(0,120));
+  else if (d.t === 'chat' && net.seatByPeer[peerId]){
+    chatPush(cname(net.seatByPeer[peerId]), String(d.msg||'').slice(0,120));
   }
 }
 
@@ -992,34 +1010,33 @@ function updateLobbyUI(){
 
 /* ----- GUEST ----- */
 function joinRoom(code){
-  initNetwork();
-  net.isHost = false;
   app.roomCode = code;
   els.homeStatus.textContent = 'Looking for room ' + code + '…';
   els.homeStatus.className = 'status';
   try {
-    const peer = new Peer({debug:0});
-    net.peer = peer;
-    peer.on('open', ()=>{
-      const conn = peer.connect('ludo-' + code, {reliable:true});
-      net.conns = [conn];
-      conn.on('open', ()=>{
-        conn.send({t:'hi', name:myName()});
-        els.homeStatus.textContent = 'Connected! Waiting for host…';
-        els.homeStatus.classList.add('ok');
-      });
-      conn.on('data', d => guestOnData(d));
-      conn.on('close', ()=>{
+    setupRoom(code, false);
+    net.onMsg = (payload, peerId) => guestOnData(payload, peerId);
+    net.room.onPeerJoin = peerId => {
+      if (!net.hostPeerId){
+        net.hostPeerId = peerId;
+        sendTo(peerId, {t:'hi', name:myName()});
+      }
+    };
+    net.room.onPeerLeave = peerId => {
+      if (peerId === net.hostPeerId){
+        net.hostPeerId = null;
         if (app.screen==='game') toast('Disconnected from host');
         else { els.homeStatus.textContent = 'Disconnected. Check the code and try again.'; els.homeStatus.classList.add('err'); }
-      });
-    });
-    peer.on('error', e=>{
-      els.homeStatus.textContent = e.type==='peer-unavailable'
-        ? 'Room not found. Check the code.'
-        : 'Network error: ' + e.type;
-      els.homeStatus.classList.add('err');
-    });
+      }
+    };
+    // Trystero joins rooms optimistically — if no host is on this code we
+    // simply never meet one. Say so after a while instead of hanging silently.
+    setTimeout(()=>{
+      if (net && !net.isHost && !net.joined && !app.mode){
+        els.homeStatus.textContent = 'Still looking… make sure the host has created the room (try re-joining).';
+        els.homeStatus.className = 'status';
+      }
+    }, 12000);
   } catch(e){
     els.homeStatus.textContent = 'Could not start networking. Are you online?';
     els.homeStatus.classList.add('err');
@@ -1030,17 +1047,23 @@ function myName(){
   return 'P' + Math.floor(100+Math.random()*900);
 }
 
-function guestOnData(d){
+function guestOnData(d, peerId){
   if (!d || typeof d !== 'object') return;
-  if (d.t === 'full'){ els.homeStatus.textContent = 'That room is full (4 players).'; els.homeStatus.classList.add('err'); return; }
-  if (d.t === 'busy'){ els.homeStatus.textContent = 'That game is already in progress.'; els.homeStatus.classList.add('err'); return; }
-  if (d.t === 'welcome'){ app.mode='online'; app.isHost=false; app.mySeat=d.seat; return; }
+  if (d.t === 'full'){ els.homeStatus.textContent = 'That room is full (4 players).'; els.homeStatus.classList.add('err'); teardownNet(); return; }
+  if (d.t === 'busy'){ els.homeStatus.textContent = 'That game is already in progress.'; els.homeStatus.classList.add('err'); teardownNet(); return; }
+  if (d.t === 'welcome'){
+    net.joined = true;
+    app.mode='online'; app.isHost=false; app.mySeat=d.seat;
+    els.homeStatus.textContent = 'Connected! You are ' + cname(d.seat) + '. Waiting for host…';
+    els.homeStatus.classList.add('ok');
+    return;
+  }
   if (d.t === 'lobby'){ app.seats=d.seats||[]; app.names=d.names||{}; return; }
-  if (d.t === 'start'){ startGameFromSnapshot(d.snap); toast('Game on! ' + cname(d.snap.g.order[d.snap.g.turn]) + ' starts.'); return; }
+  if (d.t === 'start'){ net.joined = true; startGameFromSnapshot(d.snap); toast('Game on! ' + cname(d.snap.g.order[d.snap.g.turn]) + ' starts.'); return; }
   if (d.t === 'again'){ startGameFromSnapshot(d.snap); toast('Rematch!'); return; }
   if (d.t === 'chat'){ chatPush(d.from || 'Player', String(d.msg||'').slice(0,120)); return; }
   if (d.t === 'state'){
-    if (!G){ startGameFromSnapshot(d.snap); return; }
+    if (!G){ startGameFromSnapshot(d.snap); sendTo(peerId, {t:'ack'}); return; }
     applySnapshot(d.snap, d.roll);
   }
 }
@@ -1105,7 +1128,7 @@ function setupGameUI(){
     if (!msg || app.mode!=='online') return;
     els.chatInput.value='';
     if (app.isHost){ chatPush(cname('red'), msg); send({t:'chat', from:cname('red'), msg}); }
-    else { send({t:'chat', msg}); chatPush(cname(app.mySeat), msg); }
+    else { send({t:'chat', from:cname(app.mySeat), msg}); chatPush(cname(app.mySeat), msg); }
   };
 }
 
@@ -1235,7 +1258,7 @@ $('#btnStart').onclick = ()=>{
   afterStateChange();
 };
 $('#btnLeaveCreate').onclick = ()=>{
-  if (net && net.peer){ try{ net.conns.forEach(c=>c.close()); net.peer.destroy(); }catch(e){} }
+  teardownNet();
   show('home');
 };
 $('#btnMenu').onclick = ()=>{
@@ -1266,10 +1289,12 @@ $('#btnMenu').onclick = ()=>{
   $('#mQuit').onclick = ()=>location.reload();
 };
 
-document.addEventListener('pointerdown', ()=>sfx.unlock(), {once:true});
-
-/* init */
+document.addEventListener('pointerdown', ()=>sfx.unlock(), {once:true});/* init */
 drawBoard();
-show('home');</script>
+show('home');
+
+/* debug/test handle (used by automated tests) */
+window.__LUDO = { get app(){return app;}, get G(){return G;}, curColor };
+</script>
 </body>
 </html>

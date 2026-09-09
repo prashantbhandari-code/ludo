@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html><body style="background:#111">
+<div style="color:#eee;font-family:monospace;position:fixed;top:4px;left:8px;z-index:9" id="stat">booting…</div>
+<iframe id="hostF" style="position:fixed;left:0;top:30px;width:100%;height:48%;border:1px solid #444"></iframe>
+<iframe id="guestF" style="position:fixed;left:0;top:calc(30px + 48%);width:100%;height:48%;border:1px solid #444"></iframe>
+<script>
+const H = document.getElementById('hostF'), GF = document.getElementById('guestF');
+H.src = 'index.html';
+GF.src = 'index.html';
+const stat = s => document.getElementById('stat').textContent = s;
+
+function waitLoad(fr){ return new Promise(res => { if (fr.contentWindow.__LUDO) res(); else fr.onload = ()=>setTimeout(res,300); }); }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const st = fr => fr.contentWindow.__LUDO;
+
+(async () => {
+  await waitLoad(H); await waitLoad(GF);
+  stat('apps loaded — creating room…');
+  const HA = st(H).app, HG = st(H).G;
+  H.contentWindow.document.querySelector('#btnCreate').click();
+  let code = null;
+  for (let i=0;i<120;i++){ await sleep(250); if (HA.roomCode && st(H).app.mode==='online'){ code = HA.roomCode; break; } }
+  if (!code){ stat('FAIL: host room never opened'); return; }
+  stat('host room ' + code + ' — guest joining…');
+  GF.contentWindow.document.querySelector('#joinCode').value = code;
+  GF.contentWindow.document.querySelector('#btnJoin').click();
+  // wait for welcome + lobby
+  let joined = false;
+  for (let i=0;i<120;i++){
+    await sleep(250);
+    const ga = st(GF).app;
+    if (ga.mode==='online' && ga.mySeat){ joined = true; break; }
+  }
+  if (!joined){ stat('FAIL: guest never joined'); return; }
+  stat('guest joined as ' + st(GF).app.mySeat + ' — starting game…');
+  // host: fill bots + start
+  const hc = H.contentWindow.document.querySelector('#fillBots');
+  if (hc) hc.click();
+  H.contentWindow.document.querySelector('#btnStart').click();
+  await sleep(1200);
+  if (!st(H).G || st(H).G.phase===undefined){ stat('FAIL: host game not started'); return; }
+  stat('game started — autoplay running…');
+
+  // autoplay driver: every 300ms, whoever is a human with an actionable turn acts (stress-tests re-entry)
+  const acts = {host:0, guest:0};
+  const iv = setInterval(() => {
+    try {
+      // HOST actions (red + bots)
+      const hG = st(H).G;
+      if (hG && hG.phase!=='over'){
+        const hc1 = cur(hG);
+        if (st(H).app.humans[hc1] && isMine(st(H), hc1) && hG.phase==='roll'){
+          H.contentWindow.rollDie(); acts.host++;
+        } else if (hG.phase==='move' && st(H).app.humans[hc1] && isMine(st(H), hc1)){
+          const mv = H.contentWindow.legalMoves(hc1, hG.lastRoll)[0];
+          if (mv) H.contentWindow.doMove(mv.token); acts.host++;
+        }
+      }
+      // GUEST actions (own color only)
+      const gG = st(GF).G, ga = st(GF).app;
+      if (gG && gG.phase!=='over' && ga.mode==='online'){
+        const gc = cur(gG);
+        if (gc===ga.mySeat && gG.phase==='roll'){
+          GF.contentWindow.rollDie(); acts.guest++;
+        } else if (gG.phase==='move' && gc===ga.mySeat){
+          const mv = GF.contentWindow.legalMoves(gc, gG.lastRoll)[0];
+          if (mv) GF.contentWindow.selectToken(mv.token); acts.guest++;
+        }
+      }
+      const hw = hG && hG.phase==='over';
+      const gw = gG && gG.phase==='over';
+      stat(`host acts:${acts.host} guest acts:${acts.guest} | H:${hG?hG.phase+'/'+cur(hG):'-'} G:${gG?gG.phase+'/'+cur(gG):'-'} ${hw||gw?'GAME OVER — winner: '+(hw?hG.winner:gG.winner):''}`);
+      if ((hw||gw) && acts.host + acts.guest > 5){ clearInterval(iv); stat('E2E PASS — game completed online. Winner: ' + (hw?hG.winner:gG.winner)); }
+      if (acts.host + acts.guest > 400){ clearInterval(iv); stat('E2E TIMEOUT — too many actions'); }
+    } catch(e){ stat('driver error: ' + e.message); }
+  }, 300);
+
+  function cur(G){ return G.order[G.turn]; }
+  function isMine(a, c){ return a.mode!=='online' || a.mySeat===c; }
+})();
+</script>
+</body></html>

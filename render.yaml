@@ -1,0 +1,14 @@
+services:
+  # Ludo Online — static single-page game (no build step)
+  - type: web
+    name: ludo-online
+    runtime: static
+    staticPublishPath: .
+    headers:
+      # cache the vendored library aggressively, HTML never
+      - path: /vendor/*
+        name: Cache-Control
+        value: public, max-age=86400
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
